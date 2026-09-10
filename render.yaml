@@ -1,0 +1,18 @@
+services:
+  - type: cron
+    name: forex-news-bot
+    runtime: python
+    schedule: "*/15 * * * *"   # every 15 minutes, in UTC (Render cron schedules are always UTC)
+    buildCommand: "pip install -r requirements.txt"
+    startCommand: "python3 forex_news_bot.py"
+    envVars:
+      - key: FF_BOT_TOKEN
+        sync: false            # set the real value in the Render dashboard, not here
+      - key: FF_CHAT_ID
+        sync: false
+      - key: FF_LOCAL_TZ
+        value: "UTC"            # change to your IANA timezone, e.g. Africa/Lagos
+      - key: FF_DIGEST_TIME
+        value: "06:00"
+      - key: FF_ALERT_MINUTES
+        value: "30"
