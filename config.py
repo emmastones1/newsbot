@@ -9,8 +9,8 @@ import os
 # Get a token from @BotFather on Telegram.
 # Get your chat_id by messaging your bot, then visiting:
 # https://api.telegram.org/bot<TOKEN>/getUpdates
-BOT_TOKEN = os.environ.get("FF_BOT_TOKEN", "8900372924:AAE5ZstFggoUk90W6ly6AG2rAGmkXE4e5uE")
-CHAT_ID = os.environ.get("FF_CHAT_ID", "6444118431")
+BOT_TOKEN = os.environ.get("FF_BOT_TOKEN", "PUT_YOUR_BOT_TOKEN_HERE")
+CHAT_ID = os.environ.get("FF_CHAT_ID", "PUT_YOUR_CHAT_ID_HERE")
 
 # --- Timing ---
 # Your local timezone (IANA name), used for the daily digest schedule.
