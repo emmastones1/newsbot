@@ -21,3 +21,7 @@ DAILY_DIGEST_TIME = os.environ.get("FF_DIGEST_TIME", "06:00")
 
 # How many minutes before each session opens to send the heads-up.
 ALERT_MINUTES_BEFORE = int(os.environ.get("FF_ALERT_MINUTES", "30"))
+
+# Set to "true" to bypass all time checks and send everything immediately —
+# useful for manually testing a deployment. Leave unset/false for normal use.
+FORCE_SEND = os.environ.get("FF_FORCE_SEND", "false")

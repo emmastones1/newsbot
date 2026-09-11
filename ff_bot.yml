@@ -1,0 +1,34 @@
+name: Forex News Bot
+
+on:
+  schedule:
+    - cron: '*/15 * * * *'   # every 15 minutes, UTC
+  workflow_dispatch:
+    inputs:
+      force_send:
+        description: 'Send everything immediately, ignoring schedule (for testing)'
+        type: boolean
+        default: false
+
+jobs:
+  run-bot:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run bot check
+        run: python3 forex_news_bot.py
+        env:
+          FF_BOT_TOKEN: ${{ secrets.FF_BOT_TOKEN }}
+          FF_CHAT_ID: ${{ secrets.FF_CHAT_ID }}
+          FF_LOCAL_TZ: Africa/Lagos
+          FF_DIGEST_TIME: '06:00'
+          FF_ALERT_MINUTES: '30'
+          FF_FORCE_SEND: ${{ inputs.force_send }}
