@@ -14,7 +14,7 @@ CHAT_ID = os.environ.get("FF_CHAT_ID", "PUT_YOUR_CHAT_ID_HERE")
 
 # --- Timing ---
 # Your local timezone (IANA name), used for the daily digest schedule.
-LOCAL_TZ = os.environ.get("FF_LOCAL_TZ", "UTC-1")
+LOCAL_TZ = os.environ.get("FF_LOCAL_TZ", "UTC")
 
 # Time (24h HH:MM, in LOCAL_TZ) the daily digest is sent.
 DAILY_DIGEST_TIME = os.environ.get("FF_DIGEST_TIME", "06:00")
