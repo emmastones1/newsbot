@@ -104,6 +104,7 @@ def poll_and_handle_commands() -> None:
     for u in updates:
         msg = u.get("message", {}) or {}
         text = str(msg.get("text", "")).strip().lower()
+        text = text.split("@")[0]  # strip a possible "@yourbotname" suffix Telegram may append to commands
         chat_id = msg.get("chat", {}).get("id")
         if chat_id is None:
             continue
