@@ -3,7 +3,12 @@ name: Forex News Bot
 on:
   schedule:
     - cron: '*/15 * * * *'   # every 15 minutes, UTC
-  workflow_dispatch: {}       # lets you manually trigger a run from the Actions tab
+  workflow_dispatch:
+    inputs:
+      force_send:
+        description: 'Send everything immediately, ignoring schedule (for testing)'
+        type: boolean
+        default: false
 
 jobs:
   run-bot:
@@ -26,3 +31,4 @@ jobs:
           FF_LOCAL_TZ: Africa/Lagos
           FF_DIGEST_TIME: '06:00'
           FF_ALERT_MINUTES: '30'
+          FF_FORCE_SEND: ${{ inputs.force_send }}
