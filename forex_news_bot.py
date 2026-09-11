@@ -39,15 +39,25 @@ SESSIONS = {
 CHECK_BUTTON_LABEL = "🔍 Check News Now"
 # Any of these (case-insensitive) trigger an on-demand check.
 COMMAND_TRIGGERS = {CHECK_BUTTON_LABEL.lower(), "/check", "/news"}
+START_TRIGGERS = {"/start"}
+
+WELCOME_TEXT = (
+    "👋 <b>Welcome to FX Pulse.</b>\n\n"
+    "I track high-impact ForexFactory news and ping you about it. "
+    "Tap the button below anytime to check what's on today, right now."
+)
 
 
 # --------------------------------------------------------------------------
 # Telegram
 # --------------------------------------------------------------------------
-def send_telegram_message(text: str, with_keyboard: bool = True) -> None:
+def send_telegram_message(text: str, chat_id=None, with_keyboard: bool = True) -> None:
+    """Send a message. Defaults to the owner's chat (for scheduled digests/
+    alerts); pass chat_id explicitly to reply to whoever messaged the bot."""
+    target_chat = chat_id if chat_id is not None else config.CHAT_ID
     url = f"https://api.telegram.org/bot{config.BOT_TOKEN}/sendMessage"
     payload = {
-        "chat_id": config.CHAT_ID,
+        "chat_id": target_chat,
         "text": text,
         "parse_mode": "HTML",
         "disable_web_page_preview": True,
@@ -65,13 +75,15 @@ def send_telegram_message(text: str, with_keyboard: bool = True) -> None:
         r = requests.post(url, json=payload, timeout=15)
         r.raise_for_status()
     except requests.RequestException as e:
-        log.error("Failed to send Telegram message: %s", e)
+        log.error("Failed to send Telegram message to %s: %s", target_chat, e)
 
 
 def poll_and_handle_commands() -> None:
     """
-    Check for any '/check' style command sent since the last run, and
-    respond immediately with an on-demand news scan if found.
+    Check for any new messages sent to the bot since the last run — from
+    ANYONE, not just the owner — and respond immediately:
+      - '/start' (first time a person opens the bot) -> welcome + button
+      - '/check', '/news', or the button tap -> on-demand news scan
 
     Uses Telegram's own update offset to track what's been read — no local
     state file needed, which matters since each run is a fresh, stateless
@@ -89,17 +101,19 @@ def poll_and_handle_commands() -> None:
     if not updates:
         return
 
-    triggered = False
     for u in updates:
         msg = u.get("message", {}) or {}
         text = str(msg.get("text", "")).strip().lower()
-        chat_id = str(msg.get("chat", {}).get("id", ""))
-        if chat_id == str(config.CHAT_ID) and text in COMMAND_TRIGGERS:
-            triggered = True
+        chat_id = msg.get("chat", {}).get("id")
+        if chat_id is None:
+            continue
 
-    if triggered:
-        log.info("On-demand check command received — running scan now.")
-        handle_on_demand_check()
+        if text in START_TRIGGERS:
+            log.info("New /start from chat %s — sending welcome.", chat_id)
+            send_telegram_message(WELCOME_TEXT, chat_id=chat_id)
+        elif text in COMMAND_TRIGGERS:
+            log.info("On-demand check requested by chat %s.", chat_id)
+            handle_on_demand_check(chat_id=chat_id)
 
     # Acknowledge everything up to the latest update_id so next run doesn't
     # reprocess these same messages.
@@ -240,7 +254,7 @@ def send_session_alert(session_name: str):
     send_telegram_message("\n\n".join(lines))
 
 
-def handle_on_demand_check():
+def handle_on_demand_check(chat_id=None):
     log.info("Running on-demand check")
     tz = ZoneInfo(config.LOCAL_TZ)
     now_utc = datetime.now(ZoneInfo("UTC"))
@@ -259,14 +273,14 @@ def handle_on_demand_check():
     )
 
     if not todays_events:
-        send_telegram_message(f"🔍 Checked now — {session_line}No high-impact news scheduled for today.")
+        send_telegram_message(f"🔍 Checked now — {session_line}No high-impact news scheduled for today.", chat_id=chat_id)
         return
 
     lines = [f"🔍 <b>On-demand check — {today.strftime('%A, %d %b %Y')}</b>\n{session_line}"]
     for e in todays_events:
         marker = "✅ (already out)" if e["_dt"] < now_utc else "⏳ (upcoming)"
         lines.append(f"{marker}\n{format_event_line(e, tz)}")
-    send_telegram_message("\n\n".join(lines))
+    send_telegram_message("\n\n".join(lines), chat_id=chat_id)
 
 
 # --------------------------------------------------------------------------
