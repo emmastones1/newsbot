@@ -186,32 +186,56 @@ def send_daily_digest():
     send_telegram_message("\n\n".join(lines))
 
 
-def send_session_alert(session_name: str):
-    log.info("Running session alert job: %s", session_name)
+def get_session_status(session_name: str, now_utc: datetime) -> dict:
+    """
+    Determine a session's REAL current state relative to now — not an
+    assumption. Returns:
+      status: "upcoming" | "active" | "passed"
+      minutes: minutes until open (upcoming), since close (passed), or None (active)
+      session_open / session_close: today's localized open/close datetimes
+      tz: the session's ZoneInfo
+    """
     session = SESSIONS[session_name]
     tz = ZoneInfo(session["tz"])
-    now_local = datetime.now(tz)
-
+    now_local = now_utc.astimezone(tz)
     session_open = now_local.replace(hour=session["open_hour"], minute=0, second=0, microsecond=0)
     session_close = now_local.replace(hour=session["close_hour"], minute=0, second=0, microsecond=0)
+
+    if now_local < session_open:
+        status, minutes = "upcoming", int((session_open - now_local).total_seconds() // 60)
+    elif now_local > session_close:
+        status, minutes = "passed", int((now_local - session_close).total_seconds() // 60)
+    else:
+        status, minutes = "active", None
+
+    return {"status": status, "minutes": minutes, "session_open": session_open,
+            "session_close": session_close, "tz": tz}
+
+
+def send_session_alert(session_name: str):
+    log.info("Running session alert job: %s", session_name)
+    now_utc = datetime.now(ZoneInfo("UTC"))
+    info = get_session_status(session_name, now_utc)
+    tz = info["tz"]
 
     events = get_high_impact_events(fetch_calendar())
     session_events = [
         e for e in events
-        if session_open <= e["_dt"].astimezone(tz) <= session_close
+        if info["session_open"] <= e["_dt"].astimezone(tz) <= info["session_close"]
     ]
+
+    if info["status"] == "upcoming":
+        header = f"🌍 <b>{session_name} session</b> opens in {info['minutes']} min"
+    elif info["status"] == "active":
+        header = f"🌍 <b>{session_name} session</b> is currently open"
+    else:
+        header = f"🌍 <b>{session_name} session</b> has already closed for today"
 
     if not session_events:
-        send_telegram_message(
-            f"🌍 <b>{session_name} session</b> opens in {config.ALERT_MINUTES_BEFORE} min — "
-            f"no high-impact news scheduled during this session."
-        )
+        send_telegram_message(f"{header} — no high-impact news scheduled for this session.")
         return
 
-    lines = [
-        f"🌍 <b>{session_name} session</b> opens in {config.ALERT_MINUTES_BEFORE} min — "
-        f"key news for this session:\n"
-    ]
+    lines = [f"{header} — key news for this session:\n"]
     lines += [format_event_line(e, tz) for e in session_events]
     send_telegram_message("\n\n".join(lines))
 
@@ -219,17 +243,29 @@ def send_session_alert(session_name: str):
 def handle_on_demand_check():
     log.info("Running on-demand check")
     tz = ZoneInfo(config.LOCAL_TZ)
-    today = datetime.now(tz).date()
+    now_utc = datetime.now(ZoneInfo("UTC"))
+    today = now_utc.astimezone(tz).date()
 
     events = get_high_impact_events(fetch_calendar())
     todays_events = [e for e in events if e["_dt"].astimezone(tz).date() == today]
 
+    active_session = next(
+        (name for name in SESSIONS if get_session_status(name, now_utc)["status"] == "active"),
+        None,
+    )
+    session_line = (
+        f"🕒 Currently in the <b>{active_session}</b> session.\n"
+        if active_session else "🕒 No major session currently active.\n"
+    )
+
     if not todays_events:
-        send_telegram_message("🔍 Checked now — no high-impact news scheduled for today.")
+        send_telegram_message(f"🔍 Checked now — {session_line}No high-impact news scheduled for today.")
         return
 
-    lines = [f"🔍 <b>On-demand check — {today.strftime('%A, %d %b %Y')}</b>\n"]
-    lines += [format_event_line(e, tz) for e in todays_events]
+    lines = [f"🔍 <b>On-demand check — {today.strftime('%A, %d %b %Y')}</b>\n{session_line}"]
+    for e in todays_events:
+        marker = "✅ (already out)" if e["_dt"] < now_utc else "⏳ (upcoming)"
+        lines.append(f"{marker}\n{format_event_line(e, tz)}")
     send_telegram_message("\n\n".join(lines))
 
 
@@ -237,10 +273,10 @@ def handle_on_demand_check():
 # Stateless "is it time yet?" checks
 # --------------------------------------------------------------------------
 # How close "now" must be to a target time to count as a match. Keep this
-# comfortably smaller than half your cron interval (default cron: every 15
-# min -> tolerance of 6-7 min guarantees exactly one run fires per target
+# comfortably smaller than half your cron interval (default cron: every 10
+# min -> tolerance of 4 min guarantees exactly one run fires per target
 # per day, with no duplicate-send tracking needed).
-TOLERANCE_MINUTES = 7
+TOLERANCE_MINUTES = 4
 
 
 def _within_tolerance(now: datetime, target: datetime) -> bool:
