@@ -25,3 +25,10 @@ ALERT_MINUTES_BEFORE = int(os.environ.get("FF_ALERT_MINUTES", "30"))
 # Set to "true" to bypass all time checks and send everything immediately —
 # useful for manually testing a deployment. Leave unset/false for normal use.
 FORCE_SEND = os.environ.get("FF_FORCE_SEND", "false")
+
+# --- Data encryption ---
+# Symmetric key (Fernet format) used to encrypt saved user data (rules, chat
+# ids) before it's committed to the repo. Generate once with:
+#   python3 -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
+# Store the result as a GitHub secret named FF_DATA_KEY — never commit it.
+DATA_KEY = os.environ.get("FF_DATA_KEY", "")

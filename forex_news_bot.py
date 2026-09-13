@@ -1,22 +1,29 @@
 """
 Forex Factory News Bot
 -----------------------
-Sends a daily Telegram digest of HIGH-impact ForexFactory news,
-plus a pre-session heads-up before the Asian, London, and New York
-sessions listing the high-impact events falling inside that session.
+Sends a daily Telegram digest of HIGH-impact ForexFactory news, plus a
+pre-session heads-up before the Asian, London, and New York sessions.
+Also supports:
+  - Weekday-awareness: no session alerts fire on Saturday; only the Asian
+    session fires on Sunday (the real start of the FX trading week).
+  - Weekend reminders in place of the digest on Sat/Sun.
+  - Per-user personal trading rules (/setrules, /myrules, /clearrules),
+    persisted in data/users.json and appended to that user's messages.
+  - Broadcasting the digest/session alerts to everyone who has said
+    /start to the bot, not just the original owner.
 
-Designed to run as a Render Cron Job (or any scheduler that invokes
-this script periodically, e.g. every 15 minutes). Each run is
-stateless: it checks whether "now" falls within a small tolerance
-window of any scheduled send time, and fires only those that match.
-Because each target time is computed fresh from real timezones via
-zoneinfo, DST is handled automatically — no manual UTC-offset upkeep.
+Designed to run periodically (every ~10 min) via GitHub Actions or any
+external scheduler. Each run is stateless except for data/users.json,
+which the workflow commits back to the repo when it changes.
 """
 
+import json
 import logging
+import os
 import requests
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
+from cryptography.fernet import Fernet, InvalidToken
 
 import config
 
@@ -35,25 +42,91 @@ SESSIONS = {
     "New York": {"tz": "America/New_York", "open_hour": 8, "close_hour": 17},
 }
 
-
 CHECK_BUTTON_LABEL = "🔍 Check News Now"
-# Any of these (case-insensitive) trigger an on-demand check.
-COMMAND_TRIGGERS = {CHECK_BUTTON_LABEL.lower(), "/check", "/news"}
+COMMAND_TRIGGERS = {"/check", "/news"}
 START_TRIGGERS = {"/start"}
 
 WELCOME_TEXT = (
     "👋 <b>Welcome to FX Pulse.</b>\n\n"
-    "I track high-impact ForexFactory news and ping you about it. "
-    "Tap the button below anytime to check what's on today, right now."
+    "I track high-impact ForexFactory news — a daily digest, plus a heads-up "
+    "before the Asian, London, and New York sessions.\n\n"
+    "<b>Commands:</b>\n"
+    "🔍 Check News Now — see what's on today, right now\n"
+    "/setrules &lt;text&gt; — save your own trading rules; I'll remind you of them\n"
+    "/myrules — see your saved rules\n"
+    "/clearrules — clear them"
 )
+
+WEEKEND_REMINDERS = [
+    "📖 Weekend check-in: review this week's trades. What worked, what didn't?",
+    "🧘 Markets are closed — a good day to step away from the charts and rest.",
+    "📚 Study idea: pick one setup from this week and break down why it worked (or didn't).",
+    "🚶 Go outside, get some fresh air, come back sharper on Monday.",
+    "📏 Weekend reminder: re-read your own trading rules before Monday's open.",
+    "🧠 Overtrading usually starts with under-resting. Take today off from the charts.",
+]
+
+DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
+USERS_FILE = os.path.join(DATA_DIR, "users.enc")  # encrypted — never stored as plain JSON
+
+
+# --------------------------------------------------------------------------
+# Persistent per-user data (registered users + their saved rules)
+# --------------------------------------------------------------------------
+def _get_fernet() -> Fernet:
+    key = config.DATA_KEY
+    if not key:
+        raise RuntimeError(
+            "FF_DATA_KEY is not set — can't read/write user data. "
+            "Generate a key and add it as a GitHub secret named FF_DATA_KEY."
+        )
+    return Fernet(key.encode() if isinstance(key, str) else key)
+
+
+def load_users() -> dict:
+    try:
+        with open(USERS_FILE, "rb") as f:
+            ciphertext = f.read()
+    except FileNotFoundError:
+        return {}
+
+    if not ciphertext:
+        return {}
+
+    try:
+        plaintext = _get_fernet().decrypt(ciphertext)
+        return json.loads(plaintext.decode("utf-8"))
+    except (InvalidToken, ValueError, json.JSONDecodeError) as e:
+        log.error("Could not decrypt/parse user data — starting fresh. (%s)", e)
+        return {}
+
+
+def save_users(users: dict) -> None:
+    os.makedirs(DATA_DIR, exist_ok=True)
+    plaintext = json.dumps(users, ensure_ascii=False).encode("utf-8")
+    ciphertext = _get_fernet().encrypt(plaintext)
+    with open(USERS_FILE, "wb") as f:
+        f.write(ciphertext)
+
+
+def with_rules(text: str, users: dict, chat_id) -> str:
+    rules = users.get(str(chat_id), {}).get("rules", "")
+    if rules:
+        return f"{text}\n\n📋 <b>Your rules:</b>\n{rules}"
+    return text
+
+
+def get_recipients(users: dict) -> set:
+    """Everyone who has ever interacted, plus the owner's chat as a permanent fallback."""
+    return set(users.keys()) | {str(config.CHAT_ID)}
 
 
 # --------------------------------------------------------------------------
 # Telegram
 # --------------------------------------------------------------------------
 def send_telegram_message(text: str, chat_id=None, with_keyboard: bool = True) -> None:
-    """Send a message. Defaults to the owner's chat (for scheduled digests/
-    alerts); pass chat_id explicitly to reply to whoever messaged the bot."""
+    """Send a message. Defaults to the owner's chat; pass chat_id explicitly
+    to target a specific user (on-demand replies, broadcasts, etc.)."""
     target_chat = chat_id if chat_id is not None else config.CHAT_ID
     url = f"https://api.telegram.org/bot{config.BOT_TOKEN}/sendMessage"
     payload = {
@@ -63,9 +136,6 @@ def send_telegram_message(text: str, chat_id=None, with_keyboard: bool = True) -
         "disable_web_page_preview": True,
     }
     if with_keyboard:
-        # Attaches a persistent tappable button to the chat. Telegram keeps
-        # showing it until a message explicitly changes/removes it, so
-        # sending it here on every message is enough to keep it available.
         payload["reply_markup"] = {
             "keyboard": [[CHECK_BUTTON_LABEL]],
             "resize_keyboard": True,
@@ -81,13 +151,9 @@ def send_telegram_message(text: str, chat_id=None, with_keyboard: bool = True) -
 def poll_and_handle_commands() -> None:
     """
     Check for any new messages sent to the bot since the last run — from
-    ANYONE, not just the owner — and respond immediately:
-      - '/start' (first time a person opens the bot) -> welcome + button
-      - '/check', '/news', or the button tap -> on-demand news scan
-
-    Uses Telegram's own update offset to track what's been read — no local
-    state file needed, which matters since each run is a fresh, stateless
-    container (GitHub Actions / Render Cron).
+    ANYONE, not just the owner — and respond immediately. Uses Telegram's
+    own update offset to track what's been read, so no local state file
+    is needed for this part (data/users.json is separate, persistent state).
     """
     url = f"https://api.telegram.org/bot{config.BOT_TOKEN}/getUpdates"
     try:
@@ -101,23 +167,64 @@ def poll_and_handle_commands() -> None:
     if not updates:
         return
 
+    users = load_users()
+    changed = False
+
     for u in updates:
         msg = u.get("message", {}) or {}
-        text = str(msg.get("text", "")).strip().lower()
-        text = text.split("@")[0]  # strip a possible "@yourbotname" suffix Telegram may append to commands
+        raw_text = str(msg.get("text", "")).strip()
         chat_id = msg.get("chat", {}).get("id")
-        if chat_id is None:
+        if chat_id is None or not raw_text:
             continue
+        chat_key = str(chat_id)
 
-        if text in START_TRIGGERS:
-            log.info("New /start from chat %s — sending welcome.", chat_id)
+        parts = raw_text.split(maxsplit=1)
+        cmd = parts[0].split("@")[0].lower()
+        arg = parts[1].strip() if len(parts) > 1 else ""
+
+        if cmd in START_TRIGGERS:
+            if chat_key not in users:
+                users[chat_key] = {"rules": ""}
+                changed = True
+                log.info("New user registered: %s", chat_key)
             send_telegram_message(WELCOME_TEXT, chat_id=chat_id)
-        elif text in COMMAND_TRIGGERS:
-            log.info("On-demand check requested by chat %s.", chat_id)
+
+        elif cmd in COMMAND_TRIGGERS or raw_text.lower() == CHECK_BUTTON_LABEL.lower():
             handle_on_demand_check(chat_id=chat_id)
 
-    # Acknowledge everything up to the latest update_id so next run doesn't
-    # reprocess these same messages.
+        elif cmd == "/setrules":
+            if chat_key not in users:
+                users[chat_key] = {"rules": ""}
+            if arg:
+                users[chat_key]["rules"] = arg
+                changed = True
+                send_telegram_message(
+                    "✅ Your trading rules are saved. I'll include them with your checks and alerts.",
+                    chat_id=chat_id,
+                )
+            else:
+                send_telegram_message(
+                    "Send your rules right after the command, e.g.:\n"
+                    "/setrules Never risk more than 1% per trade. No trading the first 5 min after NFP.",
+                    chat_id=chat_id,
+                )
+
+        elif cmd == "/myrules":
+            rules = users.get(chat_key, {}).get("rules", "")
+            if rules:
+                send_telegram_message(f"📋 <b>Your saved rules:</b>\n{rules}", chat_id=chat_id)
+            else:
+                send_telegram_message("You haven't saved any rules yet. Use /setrules to add some.", chat_id=chat_id)
+
+        elif cmd == "/clearrules":
+            if chat_key in users and users[chat_key].get("rules"):
+                users[chat_key]["rules"] = ""
+                changed = True
+            send_telegram_message("🗑️ Your saved rules were cleared.", chat_id=chat_id)
+
+    if changed:
+        save_users(users)
+
     max_update_id = max(u["update_id"] for u in updates)
     try:
         requests.get(url, params={"offset": max_update_id + 1, "timeout": 0}, timeout=15)
@@ -129,7 +236,6 @@ def poll_and_handle_commands() -> None:
 # ForexFactory calendar
 # --------------------------------------------------------------------------
 def fetch_calendar() -> list[dict]:
-    """Fetch this week's ForexFactory calendar as a list of event dicts."""
     try:
         r = requests.get(FF_CALENDAR_URL, timeout=20, headers={"User-Agent": "Mozilla/5.0"})
         r.raise_for_status()
@@ -143,7 +249,6 @@ def fetch_calendar() -> list[dict]:
 
 
 def parse_event_time(event: dict) -> datetime | None:
-    """ForexFactory feed gives an ISO 8601 datetime string with offset in 'date'."""
     raw = event.get("date")
     if not raw:
         return None
@@ -181,35 +286,44 @@ def format_event_line(event: dict, tz: ZoneInfo) -> str:
     return f"🔴 {time_str} | <b>{currency}</b> — {title}\n     Forecast: {forecast} | Previous: {previous}"
 
 
+def get_weekend_reminder_text(today) -> str:
+    idx = today.toordinal() % len(WEEKEND_REMINDERS)
+    return f"🗓️ <b>{today.strftime('%A, %d %b %Y')}</b>\n{WEEKEND_REMINDERS[idx]}"
+
+
 # --------------------------------------------------------------------------
 # Jobs
 # --------------------------------------------------------------------------
 def send_daily_digest():
     log.info("Running daily digest job")
     tz = ZoneInfo(config.LOCAL_TZ)
-    today = datetime.now(tz).date()
+    now_local = datetime.now(tz)
+    today = now_local.date()
+
+    users = load_users()
+    recipients = get_recipients(users)
+
+    if now_local.weekday() >= 5:  # Saturday=5, Sunday=6 -> weekend, market closed
+        base_text = get_weekend_reminder_text(today)
+        for chat_id in recipients:
+            send_telegram_message(with_rules(base_text, users, chat_id), chat_id=chat_id)
+        return
 
     events = get_high_impact_events(fetch_calendar())
     todays_events = [e for e in events if e["_dt"].astimezone(tz).date() == today]
 
     if not todays_events:
-        send_telegram_message(f"📅 <b>{today.strftime('%A, %d %b %Y')}</b>\nNo high-impact news scheduled today.")
-        return
+        base_text = f"📅 <b>{today.strftime('%A, %d %b %Y')}</b>\nNo high-impact news scheduled today."
+    else:
+        lines = [f"📅 <b>High-Impact News — {today.strftime('%A, %d %b %Y')}</b>\n"]
+        lines += [format_event_line(e, tz) for e in todays_events]
+        base_text = "\n\n".join(lines)
 
-    lines = [f"📅 <b>High-Impact News — {today.strftime('%A, %d %b %Y')}</b>\n"]
-    lines += [format_event_line(e, tz) for e in todays_events]
-    send_telegram_message("\n\n".join(lines))
+    for chat_id in recipients:
+        send_telegram_message(with_rules(base_text, users, chat_id), chat_id=chat_id)
 
 
 def get_session_status(session_name: str, now_utc: datetime) -> dict:
-    """
-    Determine a session's REAL current state relative to now — not an
-    assumption. Returns:
-      status: "upcoming" | "active" | "passed"
-      minutes: minutes until open (upcoming), since close (passed), or None (active)
-      session_open / session_close: today's localized open/close datetimes
-      tz: the session's ZoneInfo
-    """
     session = SESSIONS[session_name]
     tz = ZoneInfo(session["tz"])
     now_local = now_utc.astimezone(tz)
@@ -247,12 +361,15 @@ def send_session_alert(session_name: str):
         header = f"🌍 <b>{session_name} session</b> has already closed for today"
 
     if not session_events:
-        send_telegram_message(f"{header} — no high-impact news scheduled for this session.")
-        return
+        base_text = f"{header} — no high-impact news scheduled for this session."
+    else:
+        lines = [f"{header} — key news for this session:\n"]
+        lines += [format_event_line(e, tz) for e in session_events]
+        base_text = "\n\n".join(lines)
 
-    lines = [f"{header} — key news for this session:\n"]
-    lines += [format_event_line(e, tz) for e in session_events]
-    send_telegram_message("\n\n".join(lines))
+    users = load_users()
+    for chat_id in get_recipients(users):
+        send_telegram_message(with_rules(base_text, users, chat_id), chat_id=chat_id)
 
 
 def handle_on_demand_check(chat_id=None):
@@ -274,23 +391,21 @@ def handle_on_demand_check(chat_id=None):
     )
 
     if not todays_events:
-        send_telegram_message(f"🔍 Checked now — {session_line}No high-impact news scheduled for today.", chat_id=chat_id)
-        return
+        base_text = f"🔍 Checked now — {session_line}No high-impact news scheduled for today."
+    else:
+        lines = [f"🔍 <b>On-demand check — {today.strftime('%A, %d %b %Y')}</b>\n{session_line}"]
+        for e in todays_events:
+            marker = "✅ (already out)" if e["_dt"] < now_utc else "⏳ (upcoming)"
+            lines.append(f"{marker}\n{format_event_line(e, tz)}")
+        base_text = "\n\n".join(lines)
 
-    lines = [f"🔍 <b>On-demand check — {today.strftime('%A, %d %b %Y')}</b>\n{session_line}"]
-    for e in todays_events:
-        marker = "✅ (already out)" if e["_dt"] < now_utc else "⏳ (upcoming)"
-        lines.append(f"{marker}\n{format_event_line(e, tz)}")
-    send_telegram_message("\n\n".join(lines), chat_id=chat_id)
+    users = load_users()
+    send_telegram_message(with_rules(base_text, users, chat_id), chat_id=chat_id)
 
 
 # --------------------------------------------------------------------------
 # Stateless "is it time yet?" checks
 # --------------------------------------------------------------------------
-# How close "now" must be to a target time to count as a match. Keep this
-# comfortably smaller than half your cron interval (default cron: every 10
-# min -> tolerance of 4 min guarantees exactly one run fires per target
-# per day, with no duplicate-send tracking needed).
 TOLERANCE_MINUTES = 4
 
 
@@ -307,9 +422,21 @@ def digest_due(now_utc: datetime) -> bool:
 
 
 def session_alert_due(session_name: str, now_utc: datetime) -> bool:
+    """
+    True only if it's actually time to alert AND the FX market is realistically
+    open: no alerts at all on Saturday; only the Asian session on Sunday
+    (the real start of the trading week).
+    """
     session = SESSIONS[session_name]
     tz = ZoneInfo(session["tz"])
     now_local = now_utc.astimezone(tz)
+
+    weekday = now_local.weekday()  # Monday=0 ... Saturday=5, Sunday=6
+    if weekday == 5:
+        return False
+    if weekday == 6 and session_name != "Asian":
+        return False
+
     target_local = now_local.replace(
         hour=session["open_hour"], minute=0, second=0, microsecond=0
     ) - timedelta(minutes=config.ALERT_MINUTES_BEFORE)
@@ -317,7 +444,7 @@ def session_alert_due(session_name: str, now_utc: datetime) -> bool:
 
 
 # --------------------------------------------------------------------------
-# Entry point — run once per invocation (called by Render Cron Job)
+# Entry point — run once per invocation
 # --------------------------------------------------------------------------
 def main():
     now_utc = datetime.now(ZoneInfo("UTC"))
@@ -327,7 +454,7 @@ def main():
 
     force_send = str(config.FORCE_SEND).strip().lower() in ("1", "true", "yes")
     if force_send:
-        log.info("FF_FORCE_SEND is set — sending digest and all session alerts now, ignoring time checks.")
+        log.info("FF_FORCE_SEND is set — sending digest and all session alerts now, ignoring time/weekday checks.")
         send_daily_digest()
         for session_name in SESSIONS:
             send_session_alert(session_name)
