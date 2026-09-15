@@ -1,19 +1,25 @@
 """
 Forex Factory News Bot — scheduled side
 -----------------------------------------
-Sends the daily digest and pre-session alerts (Asian/London/New York),
-broadcasting to everyone who has said /start to the bot.
+Two jobs, both broadcasting to everyone who has said /start:
+  1. A daily digest at a fixed time.
+  2. A reminder ~30 min before EACH individual high-impact release today
+     (not tied to session opens — a release gets its own reminder
+     regardless of which session it falls in; same-time releases are
+     grouped into one message).
 
-Instant, live interactions (/start, /check, /setrules) are handled
-separately by a Cloudflare Worker (see cloudflare-worker/worker.js), which
-responds within milliseconds instead of waiting for this script's next
-scheduled run. Both sides share the same Cloudflare KV namespace for user
-data — this script only READS it (to build the broadcast list + each
-person's saved rules); only the Worker writes to it.
+Also caches today's high-impact events into Cloudflare KV every run, so
+the Cloudflare Worker (instant /check responses) can read reliable data
+without needing to fetch ForexFactory directly — ForexFactory appears to
+block/reject requests coming from Cloudflare's own network, which is why
+on-demand checks were silently coming back empty.
 
-Designed to run periodically (every ~10 min) via GitHub Actions.
+Designed to run every ~5 min via GitHub Actions (see the interval note in
+TOLERANCE_MINUTES below — this matters for not missing odd-minute release
+times like :15 or :45).
 """
 
+import json
 import logging
 import requests
 from datetime import datetime, timedelta
@@ -28,13 +34,6 @@ logging.basicConfig(
 log = logging.getLogger("ff_bot")
 
 FF_CALENDAR_URL = "https://nfs.faireconomy.media/ff_calendar_thisweek.json"
-
-SESSIONS = {
-    "Asian": {"tz": "Asia/Tokyo", "open_hour": 9, "close_hour": 18},
-    "London": {"tz": "Europe/London", "open_hour": 8, "close_hour": 17},
-    "New York": {"tz": "America/New_York", "open_hour": 8, "close_hour": 17},
-}
-
 CHECK_BUTTON_LABEL = "🔍 Check News Now"
 
 WEEKEND_REMINDERS = [
@@ -50,16 +49,17 @@ WEEKEND_REMINDERS = [
 # --------------------------------------------------------------------------
 # Shared user data — read-only here (Cloudflare Worker owns the writes)
 # --------------------------------------------------------------------------
-def load_users() -> dict:
-    """Fetch every registered user + their saved rules from Cloudflare KV."""
-    base = (
+def _kv_base() -> str:
+    return (
         f"https://api.cloudflare.com/client/v4/accounts/{config.CF_ACCOUNT_ID}"
         f"/storage/kv/namespaces/{config.CF_KV_NAMESPACE_ID}"
     )
-    headers = {"Authorization": f"Bearer {config.CF_API_TOKEN}"}
 
+
+def load_users() -> dict:
+    headers = {"Authorization": f"Bearer {config.CF_API_TOKEN}"}
     try:
-        r = requests.get(f"{base}/keys", headers=headers, timeout=15)
+        r = requests.get(f"{_kv_base()}/keys", headers=headers, timeout=15)
         r.raise_for_status()
         keys = [k["name"] for k in r.json().get("result", [])]
     except (requests.RequestException, ValueError) as e:
@@ -72,12 +72,41 @@ def load_users() -> dict:
             continue
         chat_id = key[len("user:"):]
         try:
-            vr = requests.get(f"{base}/values/{key}", headers=headers, timeout=15)
+            vr = requests.get(f"{_kv_base()}/values/{key}", headers=headers, timeout=15)
             vr.raise_for_status()
             users[chat_id] = vr.json()
         except (requests.RequestException, ValueError) as e:
             log.error("Failed to read Cloudflare KV key %s: %s", key, e)
     return users
+
+
+def cache_calendar_to_kv(todays_events: list[dict]) -> None:
+    """Write today's high-impact events to KV so the Worker can read them
+    reliably instead of fetching ForexFactory directly (see module docstring)."""
+    headers = {"Authorization": f"Bearer {config.CF_API_TOKEN}", "Content-Type": "application/json"}
+    payload = {
+        "updated_at": datetime.now(ZoneInfo("UTC")).isoformat(),
+        "events": [
+            {
+                "date": e["date"],
+                "country": e.get("country", ""),
+                "title": e.get("title", ""),
+                "forecast": e.get("forecast", ""),
+                "previous": e.get("previous", ""),
+            }
+            for e in todays_events
+        ],
+    }
+    try:
+        r = requests.put(
+            f"{_kv_base()}/values/calendar_cache",
+            headers=headers,
+            data=json.dumps(payload),
+            timeout=15,
+        )
+        r.raise_for_status()
+    except requests.RequestException as e:
+        log.error("Failed to cache calendar to KV: %s", e)
 
 
 def with_rules(text: str, users: dict, chat_id) -> str:
@@ -157,6 +186,12 @@ def get_high_impact_events(events: list[dict]) -> list[dict]:
     return out
 
 
+def get_todays_high_impact_events(tz: ZoneInfo) -> list[dict]:
+    today = datetime.now(tz).date()
+    events = get_high_impact_events(fetch_calendar())
+    return [e for e in events if e["_dt"].astimezone(tz).date() == today]
+
+
 # --------------------------------------------------------------------------
 # Formatting
 # --------------------------------------------------------------------------
@@ -178,9 +213,8 @@ def get_weekend_reminder_text(today) -> str:
 # --------------------------------------------------------------------------
 # Jobs
 # --------------------------------------------------------------------------
-def send_daily_digest():
+def send_daily_digest(todays_events: list[dict], tz: ZoneInfo):
     log.info("Running daily digest job")
-    tz = ZoneInfo(config.LOCAL_TZ)
     now_local = datetime.now(tz)
     today = now_local.date()
 
@@ -189,14 +223,7 @@ def send_daily_digest():
 
     if now_local.weekday() >= 5:  # Saturday=5, Sunday=6
         base_text = get_weekend_reminder_text(today)
-        for chat_id in recipients:
-            send_telegram_message(with_rules(base_text, users, chat_id), chat_id=chat_id)
-        return
-
-    events = get_high_impact_events(fetch_calendar())
-    todays_events = [e for e in events if e["_dt"].astimezone(tz).date() == today]
-
-    if not todays_events:
+    elif not todays_events:
         base_text = f"📅 <b>{today.strftime('%A, %d %b %Y')}</b>\nNo high-impact news scheduled today."
     else:
         lines = [f"📅 <b>High-Impact News — {today.strftime('%A, %d %b %Y')}</b>\n"]
@@ -207,59 +234,56 @@ def send_daily_digest():
         send_telegram_message(with_rules(base_text, users, chat_id), chat_id=chat_id)
 
 
-def get_session_status(session_name: str, now_utc: datetime) -> dict:
-    session = SESSIONS[session_name]
-    tz = ZoneInfo(session["tz"])
+def send_pre_news_alerts(now_utc: datetime, todays_events: list[dict], tz: ZoneInfo) -> None:
+    """Fire ~ALERT_MINUTES_BEFORE minutes before EACH individual release
+    (grouping releases that share an exact time into one message)."""
     now_local = now_utc.astimezone(tz)
-    session_open = now_local.replace(hour=session["open_hour"], minute=0, second=0, microsecond=0)
-    session_close = now_local.replace(hour=session["close_hour"], minute=0, second=0, microsecond=0)
+    if now_local.weekday() == 5 or not todays_events:  # Saturday, or nothing today
+        return
 
-    if now_local < session_open:
-        status, minutes = "upcoming", int((session_open - now_local).total_seconds() // 60)
-    elif now_local > session_close:
-        status, minutes = "passed", int((now_local - session_close).total_seconds() // 60)
-    else:
-        status, minutes = "active", None
-
-    return {"status": status, "minutes": minutes, "session_open": session_open,
-            "session_close": session_close, "tz": tz}
-
-
-def send_session_alert(session_name: str):
-    log.info("Running session alert job: %s", session_name)
-    now_utc = datetime.now(ZoneInfo("UTC"))
-    info = get_session_status(session_name, now_utc)
-    tz = info["tz"]
-
-    events = get_high_impact_events(fetch_calendar())
-    session_events = [
-        e for e in events
-        if info["session_open"] <= e["_dt"].astimezone(tz) <= info["session_close"]
-    ]
-
-    if info["status"] == "upcoming":
-        header = f"🌍 <b>{session_name} session</b> opens in {info['minutes']} min"
-    elif info["status"] == "active":
-        header = f"🌍 <b>{session_name} session</b> is currently open"
-    else:
-        header = f"🌍 <b>{session_name} session</b> has already closed for today"
-
-    if not session_events:
-        base_text = f"{header} — no high-impact news scheduled for this session."
-    else:
-        lines = [f"{header} — key news for this session:\n"]
-        lines += [format_event_line(e, tz) for e in session_events]
-        base_text = "\n\n".join(lines)
+    groups: dict[datetime, list[dict]] = {}
+    for e in todays_events:
+        key = e["_dt"].replace(second=0, microsecond=0)
+        groups.setdefault(key, []).append(e)
 
     users = load_users()
-    for chat_id in get_recipients(users):
+    recipients = get_recipients(users)
+
+    for event_time, group in groups.items():
+        target = event_time - timedelta(minutes=config.ALERT_MINUTES_BEFORE)
+        if not _within_tolerance(now_utc, target):
+            continue
+        local_time_str = event_time.astimezone(tz).strftime("%H:%M")
+        lines = [f"⏰ <b>News in {config.ALERT_MINUTES_BEFORE} min ({local_time_str})</b>\n"]
+        lines += [format_event_line(e, tz) for e in group]
+        base_text = "\n\n".join(lines)
+        for chat_id in recipients:
+            send_telegram_message(with_rules(base_text, users, chat_id), chat_id=chat_id)
+
+
+def send_all_todays_news_now(todays_events: list[dict], tz: ZoneInfo) -> None:
+    """Used by the force-send test path — broadcast everything today, ignoring timing."""
+    users = load_users()
+    recipients = get_recipients(users)
+    if not todays_events:
+        base_text = "🔍 Force test — no high-impact news scheduled for today."
+    else:
+        lines = ["🔍 <b>Force test — today's high-impact news</b>\n"]
+        lines += [format_event_line(e, tz) for e in todays_events]
+        base_text = "\n\n".join(lines)
+    for chat_id in recipients:
         send_telegram_message(with_rules(base_text, users, chat_id), chat_id=chat_id)
 
 
 # --------------------------------------------------------------------------
 # Stateless "is it time yet?" checks
 # --------------------------------------------------------------------------
-TOLERANCE_MINUTES = 4
+# Individual news releases can land on any quarter-hour (:00/:15/:30/:45),
+# not just round hours, so this needs a tighter grid+tolerance than the old
+# session-open-only design: every 5 min with 3 min tolerance guarantees any
+# quarter-hour target is always within reach of the nearest check, with no
+# double-fire risk (tolerance stays under half the interval).
+TOLERANCE_MINUTES = 3
 
 
 def _within_tolerance(now: datetime, target: datetime) -> bool:
@@ -274,28 +298,6 @@ def digest_due(now_utc: datetime) -> bool:
     return _within_tolerance(now_local, target_local)
 
 
-def session_alert_due(session_name: str, now_utc: datetime) -> bool:
-    """
-    True only if it's actually time to alert AND the FX market is realistically
-    open: no alerts at all on Saturday; only the Asian session on Sunday
-    (the real start of the trading week).
-    """
-    session = SESSIONS[session_name]
-    tz = ZoneInfo(session["tz"])
-    now_local = now_utc.astimezone(tz)
-
-    weekday = now_local.weekday()  # Monday=0 ... Saturday=5, Sunday=6
-    if weekday == 5:
-        return False
-    if weekday == 6 and session_name != "Asian":
-        return False
-
-    target_local = now_local.replace(
-        hour=session["open_hour"], minute=0, second=0, microsecond=0
-    ) - timedelta(minutes=config.ALERT_MINUTES_BEFORE)
-    return _within_tolerance(now_local, target_local)
-
-
 # --------------------------------------------------------------------------
 # Entry point — run once per invocation
 # --------------------------------------------------------------------------
@@ -303,20 +305,21 @@ def main():
     now_utc = datetime.now(ZoneInfo("UTC"))
     log.info("Run check at %s UTC", now_utc.isoformat())
 
+    tz = ZoneInfo(config.LOCAL_TZ)
+    todays_events = get_todays_high_impact_events(tz)
+    cache_calendar_to_kv(todays_events)
+
     force_send = str(config.FORCE_SEND).strip().lower() in ("1", "true", "yes")
     if force_send:
-        log.info("FF_FORCE_SEND is set — sending digest and all session alerts now, ignoring time/weekday checks.")
-        send_daily_digest()
-        for session_name in SESSIONS:
-            send_session_alert(session_name)
+        log.info("FF_FORCE_SEND is set — sending digest and all of today's news now, ignoring time checks.")
+        send_daily_digest(todays_events, tz)
+        send_all_todays_news_now(todays_events, tz)
         return
 
     if digest_due(now_utc):
-        send_daily_digest()
+        send_daily_digest(todays_events, tz)
 
-    for session_name in SESSIONS:
-        if session_alert_due(session_name, now_utc):
-            send_session_alert(session_name)
+    send_pre_news_alerts(now_utc, todays_events, tz)
 
 
 if __name__ == "__main__":

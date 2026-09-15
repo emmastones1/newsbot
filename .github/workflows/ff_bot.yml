@@ -2,7 +2,8 @@ name: Forex News Bot
 
 on:
   schedule:
-    - cron: '*/10 * * * *'   # every 10 minutes, UTC (GitHub doesn't guarantee exact timing)
+    - cron: '*/5 * * * *'   # every 5 minutes, UTC — tighter grid so odd-minute
+                             # news release times (e.g. :15, :45) aren't missed
   workflow_dispatch:
     inputs:
       force_send:
